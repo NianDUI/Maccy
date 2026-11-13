@@ -84,8 +84,6 @@ class HistoryItem {
   @Relationship(deleteRule: .cascade, inverse: \HistoryItemContent.item)
   var contents: [HistoryItemContent] = []
 
-  @Transient private var cachedDecodedImage: NSImage?
-
   init(contents: [HistoryItemContent] = []) {
     self.firstCopiedAt = firstCopiedAt
     self.lastCopiedAt = lastCopiedAt
@@ -184,16 +182,17 @@ class HistoryItem {
     return data
   }
 
+  var hasImageRepresentation: Bool { hasContent(Self.imageTypes) || universalClipboardImage }
+  var hasPlainTextRepresentation: Bool { hasContent([.string]) }
+  var hasRichTextRepresentation: Bool { hasContent([.rtf, .html]) }
+  var hasFileURLRepresentation: Bool { hasContent([.fileURL]) && !universalClipboardText }
+
   var image: NSImage? {
-    if let img = cachedDecodedImage {
-      return img
-    }
     guard let data = imageData else {
       return nil
     }
 
-    cachedDecodedImage = NSImage(data: data)
-    return cachedDecodedImage
+    return NSImage(data: data)
   }
 
   var rtfData: Data? { contentData([.rtf]) }
@@ -203,11 +202,6 @@ class HistoryItem {
     }
 
     return NSAttributedString(rtf: data, documentAttributes: nil)
-  }
-
-  func clearDecodedImageCache() {
-    cachedDecodedImage?.recache()
-    cachedDecodedImage = nil
   }
 
   var text: String? {
@@ -227,12 +221,12 @@ class HistoryItem {
     return Int(modified)
   }
 
-  var fromMaccy: Bool { contentData([.fromMaccy]) != nil }
-  var universalClipboard: Bool { contentData([.universalClipboard]) != nil }
+  var fromMaccy: Bool { hasContent([.fromMaccy]) }
+  var universalClipboard: Bool { hasContent([.universalClipboard]) }
 
   private var universalClipboardImage: Bool { universalClipboard && fileURLs.first?.pathExtension == "jpeg" }
   private var universalClipboardText: Bool {
-    universalClipboard && contentData([.html, .tiff, .png, .jpeg, .rtf, .string, .heic]) != nil
+    universalClipboard && hasContent([.html, .tiff, .png, .jpeg, .rtf, .string, .heic])
   }
 
   private func contentData(_ types: [NSPasteboard.PasteboardType]) -> Data? {
@@ -241,6 +235,11 @@ class HistoryItem {
     })
 
     return content?.value
+  }
+
+  private func hasContent(_ types: [NSPasteboard.PasteboardType]) -> Bool {
+    let rawTypes = Set(types.map(\.rawValue))
+    return contents.contains { rawTypes.contains($0.type) }
   }
 
   private func allContentData(_ types: [NSPasteboard.PasteboardType]) -> [Data] {

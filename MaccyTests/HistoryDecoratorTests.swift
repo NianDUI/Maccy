@@ -66,18 +66,66 @@ extension SharedStateTests {
       let image = try #require(NSImage(named: "StatusBarMenuImage"))
       let itemDecorator = historyItemDecorator(image)
       itemDecorator.sizeImages()
+      let previewImage = try #require(itemDecorator.previewImage)
       #expect(itemDecorator.title == "")
-      #expect(try #require(itemDecorator.previewImage).size == image.size)
+      #expect(previewImage.size == image.size)
+      #expect(previewImage.pixelSize == itemDecorator.item.image?.pixelSize)
       #expect(try #require(itemDecorator.thumbnailImage).size == image.size)
     }
 
     // We also need to add test for image with width bigger than max width.
     @Test("Image with height bigger than max height")
-    func imageWithHeightBiggerThanMaxHeight() throws {
+    func imageWithHeightBiggerThanMaxHeight() async throws {
       let image = try #require(NSImage(named: "NSApplicationIcon"))
       let itemDecorator = historyItemDecorator(image)
+      itemDecorator.ensureThumbnailImage()
+      await itemDecorator.thumbnailImageGenerationTask?.value
+      let thumbnailImage = try #require(itemDecorator.thumbnailImage)
+      #expect(thumbnailImage.size == NSSize(width: 40, height: 40))
+      #expect(thumbnailImage.pixelSize.width >= thumbnailImage.size.width)
+      #expect(thumbnailImage.pixelSize.height >= thumbnailImage.size.height)
+    }
+
+    @Test("Image detection uses the pasteboard type without decoding")
+    func imageDetectionUsesPasteboardType() {
+      let itemDecorator = historyItemDecorator(Data("not an image".utf8), .png)
+      #expect(itemDecorator.hasImage)
+      #expect(itemDecorator.item.image == nil)
+      #expect(itemDecorator.previewText.string.isEmpty)
+    }
+
+    @Test("Image menu bar text uses the OCR title")
+    func imageMenuBarTextUsesTitle() throws {
+      let image = try #require(NSImage(named: "StatusBarMenuImage"))
+      let itemDecorator = historyItemDecorator(image)
+      itemDecorator.item.title = "recognized text"
+
+      #expect(itemDecorator.text == "recognized text")
+      #expect(itemDecorator.previewText.string.isEmpty)
+    }
+
+    @Test("Image caches are cleared with the decorator")
+    func imageCachesAreCleared() throws {
+      let image = try #require(NSImage(named: "StatusBarMenuImage"))
+      let itemDecorator = historyItemDecorator(image)
       itemDecorator.sizeImages()
-      #expect(try #require(itemDecorator.thumbnailImage).size == NSSize(width: 40, height: 40))
+      #expect(itemDecorator.previewImage != nil)
+      #expect(itemDecorator.thumbnailImage != nil)
+
+      itemDecorator.cleanupImages()
+
+      #expect(itemDecorator.previewImage == nil)
+      #expect(itemDecorator.thumbnailImage == nil)
+    }
+
+    @Test("Preview generation returns the image independently of cache retention")
+    func previewGenerationReturnsImage() async throws {
+      let image = try #require(NSImage(named: "StatusBarMenuImage"))
+      let itemDecorator = historyItemDecorator(image)
+
+      let previewImage = try #require(await itemDecorator.asyncGetPreviewImage())
+
+      #expect(previewImage.pixelSize == itemDecorator.item.image?.pixelSize)
     }
 
     @Test("File", arguments: ["/tmp/foo.bar", "/tmp/产品培训/产品培训.txt"])
