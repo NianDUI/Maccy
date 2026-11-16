@@ -10,6 +10,27 @@ nonisolated struct StorageType: Sendable {
   var types: [NSPasteboard.PasteboardType]
 }
 
+/// Internal rollout switches can be enabled persistently through Defaults or
+/// for one installed-app validation run through explicit command-line flags.
+/// The command-line path avoids CFPreferences caching while keeping every new
+/// storage behavior disabled for normal launches until release gates pass.
+enum StorageRollout {
+  static var externalPayloadStorageEnabled: Bool {
+    Defaults[.externalPayloadStorageEnabled] ||
+      CommandLine.arguments.contains("--maccy-enable-external-payload-storage")
+  }
+
+  static var manifestReplayEnabled: Bool {
+    Defaults[.manifestReplayEnabled] ||
+      CommandLine.arguments.contains("--maccy-enable-manifest-replay")
+  }
+
+  static var verifiedInlinePayloadCleanupEnabled: Bool {
+    Defaults[.verifiedInlinePayloadCleanupEnabled] ||
+      CommandLine.arguments.contains("--maccy-enable-verified-inline-cleanup")
+  }
+}
+
 nonisolated extension Defaults.Keys {
 #if DEBUG
   // UI Tests bundle preferences
@@ -29,6 +50,15 @@ nonisolated extension Defaults.Keys {
   static let clipboardCheckInterval = Key<Double>("clipboardCheckInterval", default: 0.5, suite: preferencesSuite)
   static let enabledPasteboardTypes = Key<Set<NSPasteboard.PasteboardType>>(
     "enabledPasteboardTypes", default: Set(StorageType.all.types), suite: preferencesSuite
+  )
+  static let externalPayloadStorageEnabled = Key<Bool>(
+    "externalPayloadStorageEnabled", default: false, suite: preferencesSuite
+  )
+  static let manifestReplayEnabled = Key<Bool>(
+    "manifestReplayEnabled", default: false, suite: preferencesSuite
+  )
+  static let verifiedInlinePayloadCleanupEnabled = Key<Bool>(
+    "verifiedInlinePayloadCleanupEnabled", default: false, suite: preferencesSuite
   )
   static let highlightMatch = Key<HighlightMatch>("highlightMatch", default: .bold, suite: preferencesSuite)
   static let ignoreAllAppsExceptListed = Key<Bool>("ignoreAllAppsExceptListed", default: false, suite: preferencesSuite)

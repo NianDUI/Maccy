@@ -27,6 +27,7 @@ struct ItemEditorView: View {
   @FocusState private var focusedField: Field?
 
   init(for item: HistoryItemDecorator) {
+    item.loadPreviewText()
     self.item = item
     self._editableTitle = State(initialValue: item.item.title)
     self._editableContent = State(initialValue: LargeTextView.EditorState(text: item.previewText.string))
@@ -209,12 +210,14 @@ struct ItemEditorView: View {
     if let index = historyItem.contents.firstIndex(where: {
       $0.type == stringType
     }) {
-      historyItem.contents[index].value = data
+      historyItem.contents[index].replaceInlineValue(data)
     } else {
       historyItem.contents.append(
         HistoryItemContent(type: stringType, value: data)
       )
     }
+    historyItem.thumbnailRevision &+= 1
+    historyItem.refreshMetadata()
   }
 
   private func saveChanges() {

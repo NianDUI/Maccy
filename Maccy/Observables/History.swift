@@ -80,6 +80,18 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   @ObservationIgnored
   private var sessionLog: [Int: HistoryItem] = [:]
 
+  private struct PendingClearRequest {
+    let id = UUID()
+    let includePinned: Bool
+    let cutoff: Date
+  }
+
+  @ObservationIgnored
+  private var pendingClearRequest: PendingClearRequest?
+
+  @ObservationIgnored
+  private var clearTask: Task<Void, Never>?
+
 #if DEBUG
   static let isRunningUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 #endif
@@ -124,6 +136,7 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func load() async throws {
+    try await Storage.shared.prepareForHistoryLoad()
     let descriptor = FetchDescriptor<HistoryItem>()
     let results = try Storage.shared.context.fetch(descriptor)
     let decorators = sorter.sort(results).map { HistoryItemDecorator($0) }
@@ -170,6 +183,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
     if let existingHistoryItem = findSimilarItem(item) {
       if isModified(item) == nil {
         transferContents(from: existingHistoryItem, to: item)
+        item.manifestVersion = existingHistoryItem.manifestVersion
+        item.refreshMetadata()
       }
       item.firstCopiedAt = existingHistoryItem.firstCopiedAt
       item.numberOfCopies += existingHistoryItem.numberOfCopies
@@ -236,24 +251,55 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   func clear() {
-    withLogging("Clearing history") {
+    let cutoff = Date.now
+    prepareClear(includePinned: false)
+    deletePreparedHistory(includePinned: false, cutoff: cutoff)
+  }
+
+  @MainActor
+  func clearAll() {
+    let cutoff = Date.now
+    prepareClear(includePinned: true)
+    deletePreparedHistory(includePinned: true, cutoff: cutoff)
+  }
+
+  @MainActor
+  func clearSynchronouslyForTermination() {
+    clearTask?.cancel()
+    let cutoff = Date.now
+    prepareClear(includePinned: false)
+    try? Storage.shared.deleteHistoryImmediately(includePinned: false, copiedBeforeOrAt: cutoff)
+    pendingClearRequest = nil
+    clearTask = nil
+  }
+
+  @MainActor
+  func finishPendingClearSynchronouslyForTermination() {
+    clearTask?.cancel()
+    guard let request = pendingClearRequest else { return }
+    try? Storage.shared.deleteHistoryImmediately(
+      includePinned: request.includePinned,
+      copiedBeforeOrAt: request.cutoff
+    )
+    pendingClearRequest = nil
+    clearTask = nil
+  }
+
+  @MainActor
+  private func prepareClear(includePinned: Bool) {
+    if includePinned {
+      allPinnedItems.forEach(cleanup)
+      allUnpinnedItems.forEach(cleanup)
+      allUnpinnedItems.removeAll()
+      filteredPinnedItems.removeAll()
+      filteredUnpinnedItems.removeAll()
+      pinManager.removeAll()
+      sessionLog.removeAll()
+    } else {
       allUnpinnedItems.forEach(cleanup)
       allUnpinnedItems.removeAll()
       filteredUnpinnedItems.removeAll()
       sessionLog.removeValues { $0.pin == nil }
-
-      try? Storage.shared.context.transaction {
-        try? Storage.shared.context.delete(
-          model: HistoryItem.self,
-          where: #Predicate { $0.pin == nil }
-        )
-        try? Storage.shared.context.delete(
-          model: HistoryItemContent.self,
-          where: #Predicate { $0.item?.pin == nil }
-        )
-      }
-      Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
     }
 
     Clipboard.shared.clear()
@@ -264,38 +310,44 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
   }
 
   @MainActor
-  func clearAll() {
-    withLogging("Clearing all history") {
-      allPinnedItems.forEach(cleanup)
-      allUnpinnedItems.forEach(cleanup)
-      allUnpinnedItems.removeAll()
-      filteredPinnedItems.removeAll()
-      filteredUnpinnedItems.removeAll()
-      pinManager.removeAll()
-      sessionLog.removeAll()
-
-      do {
-        let context = Storage.shared.context
-        try context.transaction {
-          // Bulk deletion cannot remove children with live inverse relationships.
-          try context.delete(
-            model: HistoryItemContent.self,
-            where: #Predicate { $0.item == nil }
-          )
-          try context.delete(model: HistoryItem.self)
-          try context.delete(model: HistoryItemContent.self)
-        }
-      } catch {
-        logger.error("Failed to clear storage: \(String(reflecting: error))")
+  private func deletePreparedHistory(includePinned: Bool, cutoff: Date) {
+    let message = includePinned ? "Clearing all history" : "Clearing history"
+    if AppDelegate.isTesting {
+      withLogging(message) {
+        try? Storage.shared.deleteHistoryImmediately(
+          includePinned: includePinned,
+          copiedBeforeOrAt: cutoff
+        )
       }
-      Storage.shared.context.processPendingChanges()
-      try? Storage.shared.context.save()
+      return
     }
 
-    Clipboard.shared.clear()
-    AppState.shared.popup.close()
-    Task {
-      AppState.shared.popup.needsResize = true
+    // A later normal clear must not weaken an in-flight "clear all" request.
+    // Its newer cutoff already covers the earlier time range, while the OR
+    // preserves the stronger pinned-item deletion intent.
+    let effectiveIncludePinned = includePinned || (pendingClearRequest?.includePinned ?? false)
+    clearTask?.cancel()
+    let request = PendingClearRequest(includePinned: effectiveIncludePinned, cutoff: cutoff)
+    pendingClearRequest = request
+    clearTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        if self.pendingClearRequest?.id == request.id {
+          self.pendingClearRequest = nil
+          self.clearTask = nil
+        }
+      }
+      logger.info("\(message) started")
+      do {
+        try await Storage.shared.deleteHistoryInBatches(
+          includePinned: effectiveIncludePinned,
+          copiedBeforeOrAt: cutoff
+        )
+        logger.info("\(message) completed")
+        _ = try? await Storage.shared.garbageCollectPayloads()
+      } catch {
+        logger.error("\(message) failed: \(String(reflecting: error))")
+      }
     }
   }
 
@@ -507,7 +559,8 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   private func findSimilarItem(_ item: HistoryItem) -> HistoryItem? {
-    if let duplicate = firstStoredItem(where: { $0.item != item && $0.item.supersedes(item) }) {
+    let identities = item.comparableContentIdentities()
+    if let duplicate = firstStoredItem(where: { $0.item != item && $0.item.supersedes(identities) }) {
       return duplicate.item
     }
 
@@ -566,7 +619,10 @@ class History: ItemsContainer { // swiftlint:disable:this type_body_length
 
   @MainActor
   private func updateTitlesForSpecialSymbols() {
-    for item in items where item.item.imageData == nil {
+    // Title formatting is a metadata-only operation. Reading `imageData` here
+    // used to fault every image payload whenever the special-symbol setting
+    // changed, even though image titles are intentionally left untouched.
+    for item in items where !item.item.presentsAsImage {
       updateTitle(item: item, title: item.item.generateTitle())
     }
   }

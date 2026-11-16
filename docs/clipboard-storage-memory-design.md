@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted; implementation in progress. This document defines a compatibility-first redesign of Maccy's clipboard persistence and image memory management. The target architecture is implemented incrementally so every phase can be measured, tested, and rolled back independently.
+Accepted; implementation and installed-store rollout validation are in progress. This document defines a compatibility-first redesign of Maccy's clipboard persistence and image memory management. The target architecture is implemented incrementally so every phase can be measured, tested, and rolled back independently.
 
 ## Implementation Strategy
 
@@ -28,30 +28,94 @@ Each phase must leave the application releasable. Phase 2 cannot start until Pha
 - [x] Avoid computing image-only preview text during decorator initialization.
 - [x] Cancel off-screen thumbnail work and release active preview references.
 - [x] Add unit tests for type-only detection, cache invalidation, and decorator deallocation.
-- [ ] Measure launch, scrolling, preview, and clear-history memory behavior with 200 image entries.
+- [x] Run the automated 200-image scroll/preview/release memory regression.
+- [x] Run the 1,000+ image replacement/eviction plateau regression required by the original acceptance criteria.
+- [x] Measure installed-app launch and steady-state memory with the production store.
+- [x] Measure installed-app scrolling and preview responsiveness with the production store.
+- [x] Measure bounded 200-item clear responsiveness on a disposable store; keep destructive production clearing out of manual validation.
+- [x] Present spreadsheet clipboard bundles as text when they also contain a rendered image, while retaining every image/rich-text/private representation for replay.
 
 #### Phase 2: External payload store
 
-- [ ] Define versioned metadata and payload-reference schemas.
-- [ ] Implement atomic SHA-256-addressed payload writes and exact-byte deduplication.
-- [ ] Add dual-read access for inline BLOBs and external payloads.
-- [ ] Store new captures externally behind a feature flag.
-- [ ] Add bounded, resumable legacy migration with verification before BLOB removal.
-- [ ] Add orphan/temp-file garbage collection with a grace period.
-- [ ] Prove interrupted migration, downgrade, and rollback behavior.
+- [x] Define versioned metadata and payload-reference schemas.
+- [x] Implement atomic SHA-256-addressed payload writes and exact-byte deduplication.
+- [x] Add dual-read access for inline BLOBs and external payloads.
+- [x] Store new captures externally behind a feature flag.
+- [x] Add bounded, resumable legacy migration with verification before BLOB removal.
+- [x] Implement a separate verified inline-BLOB removal pass and bounded downgrade rehydration.
+- [x] Validate inline-BLOB removal against the installed production store under an explicit rollout flag and retain pre-cleanup backups.
+- [ ] Enable inline-BLOB removal by default only after the installed-app compatibility gate passes.
+- [x] Add orphan/temp-file garbage collection with a grace period.
+- [x] Prove interrupted migration, downgrade, and rollback behavior with automated storage tests.
 
 #### Phase 3: Manifest-preserving replay
 
-- [ ] Persist pasteboard item boundaries and representation order for new captures.
-- [ ] Add lazy `NSPasteboardItemDataProvider` replay.
-- [ ] Retain the legacy flattened replay path for legacy entries.
-- [ ] Pass byte-level and application-level compatibility tests.
+- [x] Persist pasteboard item boundaries and representation order for new captures.
+- [x] Add lazy `NSPasteboardItemDataProvider` replay.
+- [x] Retain the legacy flattened replay path for legacy entries.
+- [x] Pass automated byte-level manifest, ordering, external lazy-read, and fallback compatibility tests.
+- [ ] Pass the real-application compatibility matrix.
+- [ ] Enable external storage and manifest replay by default only after the release gates pass.
 
 #### Phase 4: Optional format synthesis
 
 - [ ] Collect compatibility evidence per source/target application and image type.
 - [ ] Define a narrow allowlist and feature flag for safe lazy synthesis.
-- [ ] Keep private, unknown, and unverified formats verbatim.
+- [x] Keep private, unknown, and unverified formats verbatim.
+
+### Implementation Audit (2026-11-13)
+
+The checklist above is verified against code and tests rather than intent:
+
+- `MaccySchemaV2` and `MaccySchemaMigrationPlan` provide a formal SwiftData schema version; the installed 2.8.0 production store containing 200 history items and, at the final audit, 614 representation rows opened, backfilled, and passed SQLite `quick_check` without history-count changes.
+- `PayloadStore` writes exact bytes to SHA-256 paths using temporary files and atomic rename, validates length/hash, deduplicates identical bytes, and performs grace-period garbage collection.
+- `HistoryItemContent` carries versioned payload-reference metadata and dual-reads verified external bytes with an inline fallback.
+- `Storage` migrates and rolls back in batches bounded by record count and byte count; completed records are the durable resume cursor.
+- inline BLOB removal is a separate verified pass and is never part of the initial migration transaction.
+- new captures record pasteboard item and representation indices; lazy replay is feature-gated and legacy records retain flattened replay.
+- lightweight `HistoryItem` metadata is backfilled in bounded batches so list/search code can stop traversing payload relationships.
+- derived PNG thumbnails are cached separately and are regenerated from the original only on a cache miss; a regression test proves a second load succeeds without original bytes.
+- clear and clear-all update the UI immediately, delete SwiftData rows in bounded batches with scheduler yields, preserve pins for normal clear, and retain synchronous completion only for tests and app termination.
+- privacy-safe diagnostics cover metadata/payload counts, payload inventory and deduplication, reads by operation, missing/corrupt references, GC reclamation, image-cache insertion/eviction cost, and OCR queue duration.
+- the final 200-image automated run measured 376 MiB baseline, 430 MiB peak, and 258 MiB after release on the test machine (54 MiB peak growth).
+- the 1,050-image replacement test, while retaining at most 200 history entries, measured 321 MiB at the midpoint and 324 MiB at the endpoint; the second half added 3 MiB rather than another history-sized tranche.
+- the complete `MaccyTests` run contains 128 tests in 15 suites: 126 passed and 2 platform-dependent cases were skipped, with zero failures. This includes bounded image-memory stress, exact manifest replay, retained-inline fallback after an external payload disappears, migration/rollback, test payload isolation, metadata-only decorator creation, payload-identity duplicate comparison without external reads, Universal Clipboard JPEG preview, recovery of true source dimensions when a disk thumbnail is cached, oversized long-image routing to the derived-thumbnail path, and WPS/Excel/OpenXML composite spreadsheet presentation.
+- bounded clear, pin preservation, and protection of copies created after clearing begins pass in the complete suite.
+- the signed/ad-hoc installed 2.8.0 build migrated 536 external representation references, removed every verified inline BLOB under an explicit cleanup flag, and left 420 unique referenced payload files (214.8 MiB). Every referenced file passed existence, byte-count, and SHA-256 verification; SQLite `quick_check` remained `ok`.
+- after cleanup, a clean installed-app launch stabilized at 116–126 MiB RSS during the first 35 seconds and 138 MiB after roughly ten minutes. `vmmap` reported a 42.3 MiB physical footprint at the sampled steady state. Before inline cleanup, the same production store stabilized near 368 MiB and external migration/GC launches could reach roughly 1.0 GiB because SwiftData materialized inline `Data` values.
+- a disposable copy of the external-only production store restored all 536 referenced representations into 345.6 MiB of inline BLOBs in bounded batches; the restored copy passed `quick_check` and sampled values matched their recorded SHA-256 hashes.
+- installed scrolling over five pages measured approximately 501 ms downward and 116 ms upward. A 36.9 MB image preview rendered sharply. A real 2468×77474 / 20.9 MB long screenshot exposed that ImageIO still inflated roughly 770 MiB even when asked for a 65×2048 result. Images whose decoded bitmap would exceed the 96 MiB preview budget therefore reuse the already-generated disk thumbnail immediately and never re-decode the original for the popup; original dimensions remain metadata.
+- the same 20.9 MB WPS source also advertised UTF-8/UTF-16 text, HTML, RTF, PNG, and private spreadsheet formats. Metadata version 2 now recognizes WPS, Microsoft Excel, and OpenXML spreadsheet markers: these composite records use searchable text for the list and popup preview, but manifest replay still retains every original representation. Installed verification showed the full table text immediately and did not enter image decoding.
+- an earlier installed 2.8.0 validation launch measured about 112 MiB RSS at five seconds with 200 history rows, 570 representation rows, zero inline BLOBs, 520 verified external references, and SQLite `quick_check` equal to `ok`. The payload directory contained 489 files / 236.1 MiB, including 416 unique hashes referenced by that snapshot.
+- an attempted UI-test run exposed that its in-memory database could still point at the production payload directory. The production store was restored from the verified dual-read backup, all references were regenerated and reverified, and `PayloadStore.shared` now uses a per-process temporary directory under UI testing. Full UI tests are not rerun against production data until database and payload-root isolation are both independently proven.
+- a later unit-test run proved a separate isolation boundary: even with an in-memory test database, clipboard tests still exercise the system pasteboard, so a simultaneously running installed Maccy can capture test UUIDs. The verified 18:03 snapshot was restored, eight legitimate records created around the test window were merged back, and the polluted store was retained separately. Installed Maccy must be stopped before clipboard tests; database/payload isolation alone is insufficient.
+- the final restored validation launch contains 200 history rows, 610 representation rows, zero inline BLOBs, and 553 verified external references; SQLite `quick_check` is `ok`, RSS was about 127 MiB after maintenance, and both long WPS records remain text-primary while retaining image metadata.
+- the real-application compatibility matrix remains a release gate. The source-code defaults remain off for a general release, while this installed validation copy has external storage, manifest replay, and verified cleanup persisted on in its active host preference domain.
+- detailed compatibility evidence is tracked in [clipboard-compatibility-matrix.md](clipboard-compatibility-matrix.md).
+
+### Original-plan traceability and remaining work
+
+This table is the authoritative audit against the original plan. "Implemented" means the code path and focused automated evidence exist. It does not mean that a feature is enabled in the installed application.
+
+| Original requirement | Current evidence | State |
+| --- | --- | --- |
+| List/search use metadata and do not decode images to determine type | Versioned fields on `HistoryItem`; decorator type checks use metadata; focused tests cover type-only detection | Implemented |
+| Read payload bytes only for OCR, preview, comparison, export, or paste | Thumbnail and preview paths load on demand; manifest replay uses lazy providers; installed external-only launch returns to baseline memory | Implemented; interactive read diagnostics pending |
+| Bound decoded-image memory independently of history size | Shared pixel-costed `NSCache`, serial off-main ImageIO schedulers, adaptive long-image preview downsampling, memory-pressure clearing, derived thumbnail cache, 1,050-entry replacement plateau regression; final installed launch was about 112 MiB RSS at five seconds | Implemented; installed scroll and normal/oversized preview checks passed |
+| Release the active large preview when it closes | Preview view drops the active reference; preview cache has a one-entry/96 MiB bound | Implemented |
+| Store exact payload bytes outside normal SwiftData `Data` fields | SHA-256 file store, atomic writes, exact-byte deduplication, dual read; 420 production references verified byte-for-byte | Implemented behind a default-off flag; installed validation enabled explicitly |
+| Remove inline BLOBs only after verification and retain downgrade support | Production cleanup reached zero inline BLOBs; disposable external-only copy restored 536 representations / 345.6 MiB and passed integrity/hash checks | Implemented and validated; default activation awaits the compatibility gate |
+| Preserve item boundaries, representation order, and exact bytes | Manifest indices, lazy providers, byte-level tests for text/rich text/images/private data | Implemented behind a default-off flag |
+| Preserve legacy replay behavior | Manifest-version gate and flattened replay fallback | Implemented |
+| Keep unknown/private formats verbatim | No normalization or synthesis; exact bytes and original type records are retained | Implemented |
+| Make migration bounded, resumable, recoverable, and garbage-collectable | Record/byte budgets, per-record durable references, rollback, grace-period GC | Implemented |
+| Keep clear-history responsive for a large store | Immediate UI removal plus bounded database batches; cutoff protects copies made during deletion; disposable 200-item timing is part of the complete suite | Implemented and tested without deleting production history |
+| Record privacy-safe storage/cache/OCR/migration diagnostics | Storage, payload, image-cache, and OCR counters plus progress/failure maintenance logs exist | Implemented; interactive diagnostic inspection remains pending |
+| Prove behavior with a real 2.8.0 store | Installed production migration/cleanup, exact verification of 420 unique referenced files, stable-memory restart, and full bounded downgrade rehydration on a disposable copy | Implemented |
+| Pass the real-application compatibility matrix | Separate matrix exists | Pending |
+| Make the new path the default | Requires installed-app performance, rollback, and compatibility evidence | Pending |
+
+The remaining sequence is therefore fixed: execute the available rows of the real-application matrix, inspect installed-app diagnostics, and only then decide whether to enable external storage/manifest replay and verified inline-BLOB cleanup by default. The production database is currently external-only for verified payloads, but the installed validation process uses explicit command-line rollout flags and durable pre-cleanup backups remain available.
 
 ## Context
 

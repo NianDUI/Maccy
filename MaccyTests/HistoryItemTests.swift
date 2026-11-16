@@ -75,6 +75,57 @@ extension SharedStateTests {
       #expect(historyItem(image).title == "")
     }
 
+    @Test(
+      "Spreadsheet bundles prefer text presentation while retaining their image",
+      arguments: [
+        "com.trolltech.anymime.WPS Spreadsheets 6.0 Format",
+        "com.microsoft.excel.cells",
+        "org.openxmlformats.spreadsheetml.sheet"
+      ]
+    )
+    func spreadsheetBundlePrefersTextPresentation(privateType: String) {
+      let text = "Room\tRate\nSingle\t100"
+      let item = HistoryItem(contents: [
+        HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: Data(text.utf8)),
+        HistoryItemContent(type: NSPasteboard.PasteboardType.png.rawValue, value: Data("png".utf8)),
+        HistoryItemContent(type: privateType, value: Data())
+      ])
+      item.title = item.generateTitle()
+
+      #expect(item.primaryContentKind == "text")
+      #expect(item.hasImageRepresentation)
+      #expect(item.hasPlainTextRepresentation)
+      #expect(item.title == "Room⇥Rate⏎Single⇥100")
+    }
+
+    @Test("Generic text and image bundles remain image presentations")
+    func genericTextAndImageBundleRemainsImagePresentation() {
+      let item = HistoryItem(contents: [
+        HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: Data("caption".utf8)),
+        HistoryItemContent(type: NSPasteboard.PasteboardType.png.rawValue, value: Data("png".utf8))
+      ])
+
+      #expect(item.primaryContentKind == "image")
+      #expect(item.generateTitle().isEmpty)
+    }
+
+    @Test("Duplicate comparison uses payload identity without reading an external file")
+    func duplicateComparisonUsesPayloadIdentity() {
+      let bytes = Data("external identity".utf8)
+      let hash = PayloadStore.hash(bytes)
+      let external = HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue)
+      external.payloadHash = hash
+      external.payloadByteCount = bytes.count
+      external.payloadVerifiedAt = .now
+      external.value = nil
+      let existing = HistoryItem(contents: [external])
+      let incoming = HistoryItem(contents: [
+        HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: bytes)
+      ])
+
+      #expect(existing.supersedes(incoming.comparableContentIdentities()))
+    }
+
     @Test("Image title becomes the recognized text")
     func imageTitleBecomesRecognizedText() async throws {
       let item = historyItem(textImage("Hello Maccy"))
@@ -168,6 +219,60 @@ extension SharedStateTests {
       #expect(item2.pin == "")
     }
 
+    @Test("External payload dual-read and rollback")
+    func externalPayloadDualReadAndRollback() throws {
+      try withPayloadStore { store in
+        let original = Data("external clipboard representation".utf8)
+        let content = HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: original)
+
+        let optionalReference = try content.externalize(retainingInlineValue: false, store: store)
+        let reference = try #require(optionalReference)
+        #expect(content.value == nil)
+        #expect(content.isExternallyStored)
+        #expect(content.resolvedValue(from: store) == original)
+        #expect(content.byteCount == original.count)
+
+        try content.restoreInlineValue(store: store)
+        #expect(content.value == original)
+
+        try Data("corrupt".utf8).write(to: store.payloadURL(for: reference.hash))
+        #expect(content.resolvedValue(from: store) == original)
+      }
+    }
+
+    @Test("Inline payload byte metadata survives default-off storage and editing")
+    func inlinePayloadByteMetadata() {
+      let original = Data("original".utf8)
+      let replacement = Data("replacement value".utf8)
+      let content = HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: original)
+
+      #expect(content.payloadHash == nil)
+      #expect(content.payloadByteCount == original.count)
+      #expect(content.byteCount == original.count)
+
+      content.replaceInlineValue(replacement)
+
+      #expect(content.payloadHash == nil)
+      #expect(content.payloadByteCount == replacement.count)
+      #expect(content.byteCount == replacement.count)
+      #expect(content.resolvedValue == replacement)
+    }
+
+    @Test("Verified external payload permits inline cleanup")
+    func verifiedExternalPayloadPermitsInlineCleanup() throws {
+      try withPayloadStore { store in
+        let original = Data("migration fallback".utf8)
+        let content = HistoryItemContent(type: NSPasteboard.PasteboardType.string.rawValue, value: original)
+
+        _ = try content.externalize(retainingInlineValue: true, store: store)
+        #expect(content.value == original)
+        try content.removeInlineValueIfVerified(store: store)
+
+        #expect(content.value == nil)
+        #expect(content.resolvedValue(from: store) == original)
+      }
+    }
+
     private func historyItem(_ value: String?) -> HistoryItem {
       let contents = [
         HistoryItemContent(
@@ -230,6 +335,14 @@ extension SharedStateTests {
       item.title = item.generateTitle()
 
       return item
+    }
+
+    private func withPayloadStore(_ body: (PayloadStore) throws -> Void) throws {
+      let root = FileManager.default.temporaryDirectory
+        .appending(path: "MaccyHistoryItemPayloadTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+      try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: root) }
+      try body(PayloadStore(baseURL: root))
     }
   }
 }

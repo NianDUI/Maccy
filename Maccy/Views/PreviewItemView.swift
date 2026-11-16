@@ -47,8 +47,13 @@ struct PreviewItemView: View {
                   idealWidth: HistoryItemDecorator.previewImageSize.width,
                   idealHeight: HistoryItemDecorator.previewImageSize.height
                 )
-              ProgressView()
-                .frame(alignment: .center)
+              if let thumbnail = item.thumbnailImage {
+                Image(nsImage: thumbnail)
+                  .resizable()
+              } else {
+                ProgressView()
+                  .frame(alignment: .center)
+              }
             }
           }
         }
@@ -114,6 +119,9 @@ struct PreviewItemView: View {
       }
     }
     .controlSize(.small)
+    .task(id: item.id) {
+      item.loadPreviewText()
+    }
     .onDisappear {
       item.previewImage = nil
     }

@@ -110,6 +110,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     migrateUserDefaults()
     disableUnusedGlobalHotkeys()
 
+    Task {
+      // Keep launch responsive and let the first event cycle settle before
+      // running bounded, resumable storage maintenance.
+      try? await Task.sleep(for: .seconds(2))
+      await Storage.shared.runBackgroundMaintenance()
+    }
+
     panel = FloatingPanel(
       contentRect: NSRect(origin: .zero, size: Defaults[.windowSize]),
       identifier: Bundle.main.bundleIdentifier ?? "org.p0deje.Maccy",
@@ -126,8 +133,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    AppState.shared.history.finishPendingClearSynchronouslyForTermination()
     if Defaults[.clearOnQuit] {
-      AppState.shared.history.clear()
+      AppState.shared.history.clearSynchronouslyForTermination()
     }
   }
 

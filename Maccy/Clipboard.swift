@@ -1,6 +1,38 @@
 import AppKit
 import Defaults
+import OSLog
 import Sauce
+
+private final class ClipboardRepresentationProvider: NSObject, NSPasteboardItemDataProvider {
+  private let type: NSPasteboard.PasteboardType
+  private let reference: PayloadReference?
+  private let content: HistoryItemContent
+
+  private let payloadStore: PayloadStore
+
+  init(content: HistoryItemContent, payloadStore: PayloadStore) {
+    self.type = NSPasteboard.PasteboardType(content.type)
+    self.reference = content.payloadVerifiedAt == nil ? nil : content.payloadReference
+    // Keep the model object rather than faulting its potentially large inline
+    // BLOB while registering the provider. If the verified external file later
+    // becomes unavailable, the provider can still fault the retained inline
+    // compatibility copy on demand.
+    self.content = content
+    self.payloadStore = payloadStore
+  }
+
+  func pasteboard(
+    _ pasteboard: NSPasteboard?,
+    item: NSPasteboardItem,
+    provideDataForType type: NSPasteboard.PasteboardType
+  ) {
+    guard type == self.type else { return }
+    guard let data = reference.flatMap({ try? payloadStore.read($0, operation: .paste) }) ?? content.value else {
+      return
+    }
+    item.setData(data, forType: type)
+  }
+}
 
 class Clipboard {
   static let shared = Clipboard()
@@ -11,8 +43,11 @@ class Clipboard {
   var changeCount: Int
 
   private let pasteboard = NSPasteboard.general
+  private let payloadStore: PayloadStore
+  private let logger = Logger(subsystem: "org.p0deje.Maccy", category: "ClipboardPayload")
 
   private var timer: Timer?
+  private var activeDataProviders: [ClipboardRepresentationProvider] = []
 
   private let dynamicTypePrefix = "dyn."
   private let microsoftSourcePrefix = "com.microsoft.ole.source."
@@ -39,7 +74,8 @@ class Clipboard {
 
   private var sourceApp: NSRunningApplication? { NSWorkspace.shared.frontmostApplication }
 
-  init() {
+  init(payloadStore: PayloadStore = .shared) {
+    self.payloadStore = payloadStore
     changeCount = pasteboard.changeCount
   }
 
@@ -64,6 +100,11 @@ class Clipboard {
   func restart() {
     timer?.invalidate()
     start()
+  }
+
+  func stop() {
+    timer?.invalidate()
+    timer = nil
   }
 
   func isPersistable(_ type: NSPasteboard.PasteboardType) -> Bool {
@@ -92,9 +133,26 @@ class Clipboard {
       contents = clearFormatting(contents)
     }
 
+    if item.manifestVersion > 0 && StorageRollout.manifestReplayEnabled {
+      copyManifest(item, contents: contents)
+    } else {
+      copyLegacy(item, contents: contents)
+    }
+
+    sync()
+
+    Task {
+      Notifier.notify(body: item.title, sound: .knock)
+      checkForChangesInPasteboard()
+    }
+  }
+
+  private func copyLegacy(_ item: HistoryItem, contents: [HistoryItemContent]) {
+    activeDataProviders.removeAll()
+
     for content in contents {
       guard content.type != NSPasteboard.PasteboardType.fileURL.rawValue else { continue }
-      pasteboard.setData(content.value, forType: NSPasteboard.PasteboardType(content.type))
+      pasteboard.setData(content.resolvedValue, forType: NSPasteboard.PasteboardType(content.type))
     }
 
     // Use writeObjects for file URLs so that multiple files that are copied actually work.
@@ -102,7 +160,7 @@ class Clipboard {
     // where the item is pasted more than once.
     let fileURLItems: [NSPasteboardItem] = contents.compactMap { item in
       guard item.type == NSPasteboard.PasteboardType.fileURL.rawValue else { return nil }
-      guard let value = item.value else { return nil }
+      guard let value = item.resolvedValue else { return nil }
       let pasteItem = NSPasteboardItem()
       pasteItem.setData(value, forType: NSPasteboard.PasteboardType(item.type))
       return pasteItem
@@ -111,12 +169,34 @@ class Clipboard {
 
     pasteboard.setString("", forType: .fromMaccy)
     pasteboard.setString(item.application ?? "", forType: .source)
-    sync()
+  }
 
-    Task {
-      Notifier.notify(body: item.title, sound: .knock)
-      checkForChangesInPasteboard()
+  private func copyManifest(_ historyItem: HistoryItem, contents: [HistoryItemContent]) {
+    let grouped = Dictionary(grouping: contents, by: \.itemIndex)
+    var providers: [ClipboardRepresentationProvider] = []
+    var pasteboardItems: [NSPasteboardItem] = []
+
+    for itemIndex in grouped.keys.sorted() {
+      guard let representations = grouped[itemIndex] else { continue }
+      let pasteboardItem = NSPasteboardItem()
+
+      for content in representations.sorted(by: { $0.representationIndex < $1.representationIndex }) {
+        let provider = ClipboardRepresentationProvider(content: content, payloadStore: payloadStore)
+        providers.append(provider)
+        pasteboardItem.setDataProvider(
+          provider,
+          forTypes: [NSPasteboard.PasteboardType(content.type)]
+        )
+      }
+
+      pasteboardItems.append(pasteboardItem)
     }
+
+    guard let firstItem = pasteboardItems.first else { return }
+    firstItem.setString("", forType: .fromMaccy)
+    firstItem.setString(historyItem.application ?? "", forType: .source)
+    activeDataProviders = providers
+    pasteboard.writeObjects(pasteboardItems)
   }
 
   // Based on https://github.com/Clipy/Clipy/blob/develop/Clipy/Sources/Services/PasteService.swift.
@@ -196,8 +276,8 @@ class Clipboard {
     // - https://github.com/p0deje/Maccy/issues/78
     // - https://github.com/p0deje/Maccy/issues/472
     var contents = [HistoryItemContent]()
-    pasteboard.pasteboardItems?.forEach({ item in
-      var types = Set(item.types)
+    pasteboard.pasteboardItems?.enumerated().forEach({ itemIndex, item in
+      var types = item.types
       if types.contains(.string) && isEmptyString(item) && !richText(item) {
         return
       }
@@ -207,18 +287,24 @@ class Clipboard {
       }
 
       types = types
-        .subtracting(disabledTypes)
-        .filter(isPersistable)
+        .filter { !disabledTypes.contains($0) && isPersistable($0) }
 
       // Avoid reading Microsoft Word links from bookmarks and cross-references.
       // https://github.com/p0deje/Maccy/issues/613
       // https://github.com/p0deje/Maccy/issues/770
-      if types.isSuperset(of: [.microsoftLinkSource, .microsoftObjectLink]) {
-        types = types.subtracting([.microsoftLinkSource, .microsoftObjectLink, .pdf])
+      if Set(types).isSuperset(of: [.microsoftLinkSource, .microsoftObjectLink]) {
+        types.removeAll { [.microsoftLinkSource, .microsoftObjectLink, .pdf].contains($0) }
       }
 
-      types.forEach { type in
-        contents.append(HistoryItemContent(type: type.rawValue, value: item.data(forType: type)))
+      types.enumerated().forEach { representationIndex, type in
+        contents.append(
+          HistoryItemContent(
+            type: type.rawValue,
+            value: item.data(forType: type),
+            itemIndex: itemIndex,
+            representationIndex: representationIndex
+          )
+        )
       }
     })
 
@@ -237,6 +323,73 @@ class Clipboard {
     historyItem.title = historyItem.generateTitle()
 
     onNewCopyHooks.forEach({ $0(historyItem) })
+
+    if StorageRollout.externalPayloadStorageEnabled {
+      scheduleExternalization(for: historyItem)
+    }
+  }
+
+  /// Pasteboard reads stay on the main actor, but hashing and file I/O do not.
+  /// Inline bytes remain the durable fallback until every payload write has
+  /// completed and the model context has saved its references.
+  @MainActor
+  func scheduleExternalization(for historyItem: HistoryItem) {
+    let imageTypes = Set(StorageType.images.types.map(\.rawValue))
+    let inputs = historyItem.contents.compactMap { content in
+      content.value.map { (id: content.id, data: $0, isImage: imageTypes.contains(content.type)) }
+    }
+    guard !inputs.isEmpty else { return }
+    let payloadStore = self.payloadStore
+    let targetSize = HistoryItemDecorator.thumbnailImageSize
+    let scale = NSScreen.forPopup?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+
+    Task { @MainActor in
+      let results = await Task.detached(priority: .utility) {
+        var results: [(id: UUID, reference: PayloadReference?, imageSize: NSSize?)] = []
+        for input in inputs {
+          let reference = try? payloadStore.write(input.data)
+          var imageSize: NSSize?
+          if input.isImage, let reference {
+            let cacheKey = reference.hash + "-\(Int(targetSize.width * scale))x\(Int(targetSize.height * scale))"
+            imageSize = await ThumbnailDecodeScheduler.shared.cachedOrGenerate(
+              cacheKey: cacheKey,
+              reference: reference,
+              inlineData: nil,
+              knownOriginalSize: nil,
+              targetSize: targetSize,
+              scale: scale,
+              payloadStore: payloadStore
+            )?.originalPixelSize
+          }
+          results.append((input.id, reference, imageSize))
+        }
+        return results
+      }.value
+
+      for result in results {
+        guard let reference = result.reference,
+              let content = historyItem.contents.first(where: { $0.id == result.id }) else { continue }
+        content.recordVerifiedPayload(reference)
+        if let imageSize = result.imageSize {
+          historyItem.recordImagePixelSize(imageSize)
+        }
+      }
+      historyItem.refreshMetadata()
+      do {
+        // Persist verified references before removing any inline fallback.
+        try Storage.shared.context.save()
+        if StorageRollout.verifiedInlinePayloadCleanupEnabled {
+          for result in results {
+            guard result.reference != nil,
+                  let content = historyItem.contents.first(where: { $0.id == result.id }) else { continue }
+            try content.removeInlineValueIfVerified(store: payloadStore)
+          }
+          try Storage.shared.context.save()
+        }
+      } catch {
+        logger.error("External payload persistence failed: \(String(reflecting: error), privacy: .public)")
+      }
+    }
   }
 
   private func shouldIgnore(_ types: Set<NSPasteboard.PasteboardType>) -> Bool {
